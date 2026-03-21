@@ -275,7 +275,7 @@ def process(args):
     recos = []
     current_search_id = 0
     # open input file (or stdin if there is none)
-    with gzip.open(args.input_file, 'r') if args.input_file is not "-" else sys.stdin as f:
+    with gzip.open(args.input_file, 'r') if args.input_file != "-" else sys.stdin as f:
         for line in f:
             cnt['reco_read'] += 1
             reco = decode_line(line)
