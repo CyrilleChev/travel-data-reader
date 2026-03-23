@@ -1,60 +1,97 @@
 """
 csvSimulator.py — Data ingestion simulator
 
-Reads a CSV sequentially and emits gzip-compressed CSV batches
-at approximately the requested frequency.
+Reads a CSV sequentially and emits gzip-compressed CSV sub-batches at 
+approximately the requested frequency times the number of threads given.
 
 Usage:
-    python csvSimulator.py --input data.csv
-    python csvSimulator.py --input data.csv --frequency 200 --output-dir ./out --num-threads 3
-"""
+    python csvSimulator.py --topic <topic>
+        => to test with default parameters on desired topic
 
+    python csvSimulator.py --topic <topic> --frequency 1000 --num-threads 10 --key-column-id 3 --max-batches 0
+        => total frequency of 10k rows/s balanced between 10 threads, keyed by column 3, going through all the CSV
+"""
 from argparse import ArgumentParser
-# Same function names so we import both whole modules
-import csv
-import gzip
+from collections.abc import Iterator
+from csv import reader as get_csv_reader, writer as get_csv_writer
+from gzip import compress as gzip_compress
 from io import StringIO
 from time import sleep
 from dataclasses import dataclass
-from datetime import datetime
 from pathlib import Path
 from numpy.random import lognormal, poisson
 from threading import Thread, Lock, current_thread
+from confluent_kafka import Producer
+from os import environ
+from aws_msk_iam_sasl_signer import MSKAuthTokenProvider    
 
 SIGMA_LOG = 1.2  # log-normal shape parameter (burstiness knob)
 DEFAULT_FREQUENCY = 500  # target rows/second per thread
-DEFAULT_OUTPUT_DIR = "./batches"
-DEFAULT_NUM_THREADS = 5 # NUmber of concurrent threads to run (each simulating an independent data stream with the same frequency)
+DEFAULT_NUM_THREADS = 5  # NUmber of concurrent threads to run (each simulating an independent data stream with the same frequency)
+DEFAULT_KEY_COLUMN_ID = 1  # column name to use as Kafka message key
+DEFAULT_MAX_BATCHES = 100  # number of batches to go through through the CSV (for testing) per thread. If set = 0, goes until the end.
+KAFKA_BOOTSTRAP_SERVERS = environ["BOOTSTRAP_SERVER"]
+REGION = environ["REGION"]
+CSV_INPUT_PATH = Path(environ["CSV_INPUT_PATH"])
+CSV_DELMITER = "^"
 
+def oauth_callback(config):
+    token, expiry_ms = MSKAuthTokenProvider.generate_auth_token(REGION)
+    return token, expiry_ms / 1000  # confluent expects seconds, not ms
 
 @dataclass
 class Config:
-    """Configuration for the CSV simulator, parsed from command-line arguments."""
-    input:        Path
-    frequency:    float
-    output_dir:   Path
-    num_threads:  int
-    started_at:   str
+    """
+    Configuration for the CSV simulator, parsed from command-line arguments
+    """
+
+    topic: str
+    frequency: float
+    num_threads: int
+    key_column_id: int
+    max_batches: int
 
 
 def parse_args() -> Config:
     """
-    Parses the arguments and sets the staretd_at timestamp for output file naming.
-    See csvSimulator.py --help for usage instructions.
+    Parses the arguments. See csvSimulator.py --help for usage instructions
     """
-    p = ArgumentParser(description="Simulate CSV gzip batches arriving from external sources.")
-    p.add_argument("--input",      required=True,           help="Source CSV file path")
-    p.add_argument("--frequency",  type=float, default=DEFAULT_FREQUENCY, help=f"Target rows/second emitted per thread (default: {DEFAULT_FREQUENCY})")
-    p.add_argument("--output-dir", default=DEFAULT_OUTPUT_DIR,     help=f"Directory for gzip output files (default: {DEFAULT_OUTPUT_DIR})")
-    p.add_argument("--num-threads", type=int, default=DEFAULT_NUM_THREADS, help=f"Number of worker threads (default: {DEFAULT_NUM_THREADS})")
+    p = ArgumentParser(
+        description="Simulate CSV gzip batches arriving from external sources."
+    )
+    p.add_argument("--topic", required=True, help="Kafka topic to send messages to")
+    p.add_argument(
+        "--frequency",
+        type=float,
+        default=DEFAULT_FREQUENCY,
+        help=f"Target rows/second emitted per thread (default: {DEFAULT_FREQUENCY})",
+    )
+    p.add_argument(
+        "--num-threads",
+        type=int,
+        default=DEFAULT_NUM_THREADS,
+        help=f"Number of worker threads (default: {DEFAULT_NUM_THREADS})",
+    )
+    p.add_argument(
+        "--key-column-id",
+        type=int,
+        default=DEFAULT_KEY_COLUMN_ID,
+        help=f"Column ID to use as Kafka message key (default: {DEFAULT_KEY_COLUMN_ID})",
+    )
+    p.add_argument(
+        "--max-batches",
+        type=int,
+        default=DEFAULT_MAX_BATCHES,
+        help=f"Number of batches to go through the CSV (default: {DEFAULT_MAX_BATCHES}). If set = 0, goes until the end.",
+    )
 
     a = p.parse_args()
     return Config(
-        input=Path(a.input),
+        topic=a.topic,
         frequency=a.frequency,
-        output_dir=Path(a.output_dir),
         num_threads=a.num_threads,
-        started_at=datetime.now().strftime("%Y%m%dT%H%M%S")
+        key_column_id=a.key_column_id,
+        max_batches=a.max_batches,
     )
 
 
@@ -90,7 +127,7 @@ def next_batch(frequency: float) -> tuple[int, float]:
     # E[time_to_wait] = 1 s, variance controlled by sigma_log
     # For LogNormal: E[X] = exp(mu + sigma²/2)
     # => mu = -sigma²/2  so that E[time_to_wait] = 1
-    mu_log = -(SIGMA_LOG ** 2) / 2
+    mu_log = -(SIGMA_LOG**2) / 2
     time_to_wait = lognormal(mean=mu_log, sigma=SIGMA_LOG)
 
     # batch_size is proportional to time_to_wait so the ratio batch_size/time_to_wait = F is maintained on avg.
@@ -100,62 +137,101 @@ def next_batch(frequency: float) -> tuple[int, float]:
 
     return batch_size, time_to_wait
 
-def worker(config: Config, reader, reader_lock: Lock, batch_lock: Lock, batch_idx: list[int]):
+
+def send_to_kafka(producer: Producer, topic: str, key: str, rows: list):
+    """Gzip-compress rows and send them to Kafka keyed by UUID."""
+    buf = StringIO()
+    writer = get_csv_writer(buf, delimiter=CSV_DELMITER)
+    writer.writerows(rows)
+    payload = gzip_compress(buf.getvalue().encode())
+    producer.produce(topic, key=key, value=payload)
+
+
+def worker(config: Config, reader: Iterator, producer: Producer, reader_lock: Lock):
     """
-    Worker thread function that reads batches of rows from the shared CSV reader, writes them to gzip files, and sleeps between batches.
-    Each worker thread simulates an independent data stream with the same frequency, reading from the same CSV file sequentially by acquiring
+    - Worker thread function that reads big batches of rows from the shared CSV reader, writes them to gzip files, and sleeps between batches.
+    - Each (potentially sub-) batch (from the big current batch) *SENT* has the same search_id because :
+    > -> the worker will cut the current big batch it reads from the CSV into several gzipped sub-batches (if needed).
+    - Each worker thread simulates an independent data stream with the same frequency, reading from the same CSV file sequentially by acquiring
     the lock on the CSV reader.
     > -> Overall script's frequency : num_threads * frequency
     """
+    loop_ctn = 0
+
     while True:
-        rows = []
+
         batch_size, time_to_wait = next_batch(config.frequency)
 
         with reader_lock:
-            for _ in range(batch_size):
-                if (row := next(reader, None)) is None:
-                    break
-                rows.append(row)
 
-        if not rows:
+            if (first_row := next(reader, None)) is None:
+                break
+
+            batch_id = first_row[config.key_column_id]
+            batch_rows = [first_row]
+
+            for _ in range(batch_size - 1):
+                if (next_row := next(reader, None)) is None:
+                    break
+
+                if (next_row_id := next_row[config.key_column_id]) != batch_id:
+                    # flush current sub-batch, start a new one
+                    send_to_kafka(producer, config.topic, batch_id, batch_rows)
+                    batch_id = next_row_id
+                    batch_rows = [next_row]
+                else:
+                    batch_rows.append(next_row)
+
+            # flush the only or last sub-batch
+            send_to_kafka(producer, config.topic, batch_id, batch_rows)
+        
+        producer.poll(0)  # trigger delivery callbacks without blocking
+        
+        print(f"[{current_thread().name}] SENT {batch_size}r | NOW SLEEP {time_to_wait:.3f}s")
+
+        loop_ctn += 1
+
+        if config.max_batches > 0 and loop_ctn >= config.max_batches:
             break
 
-        buf = StringIO()
-        writer = csv.writer(buf, delimiter="^")
-        writer.writerows(rows)
-        csv_bytes = buf.getvalue().encode()
-
-        with batch_lock:
-            idx = batch_idx[0]
-            batch_idx[0] += 1
-
-        out_path = config.output_dir / f"batch_{idx}_{config.started_at}.csv.gz"
-        with gzip.open(out_path, "wb") as gz:
-            gz.write(csv_bytes)
-
-        print(f"[thread-{current_thread().name}] batch {idx} — {batch_size} rows, sleeping {time_to_wait:.2f}s")
         sleep(time_to_wait)
+
 
 def run():
     """
-    Main function to set up configuration, common locks, and threads for the CSV simulator.
+    Main function to set up configuration, reader and producer objects, common locks, and threads for the CSV simulator.
     """
     config: Config = parse_args()
-    config.output_dir.mkdir(parents=True, exist_ok=True)
+    producer = Producer({
+        "bootstrap.servers": KAFKA_BOOTSTRAP_SERVERS,
+        # don't bother putting them as params i just don't know what the fuck it is
+        "security.protocol": "SASL_SSL",
+        "sasl.mechanism": "OAUTHBEARER",
+        "oauth_cb": oauth_callback,
+        "on_delivery": (lambda err, msg: print(f"[ERROR] {err} \n {msg}") if err else None)
+    })
 
     reader_lock = Lock()
-    batch_lock  = Lock()
-    batch_idx   = [0]  # mutable int shared across threads
 
-    with open(config.input, newline="") as fh:
+    with open(CSV_INPUT_PATH, newline="") as fh:
 
-        reader = csv.reader(fh, delimiter="^")
+        reader = get_csv_reader(fh, delimiter="^")
 
-        threads = [Thread(target=worker, args=(config, reader, reader_lock, batch_lock, batch_idx), name=str(i)) for i in range(config.num_threads)]
+        threads = [
+            Thread(
+                target=worker,
+                args=(config, reader, producer, reader_lock),
+                name=str(i),
+            )
+            for i in range(config.num_threads)
+        ]
         for t in threads:
             t.start()
         for t in threads:
             t.join()
+
+    producer.flush()  # wait for all in-flight messages to be delivered
+
 
 if __name__ == "__main__":
     run()

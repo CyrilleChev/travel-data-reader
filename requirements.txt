@@ -1,3 +1,5 @@
 git+https://github.com/alexprengere/neobase.git
 pytest
 numpy
+confluent_kafka
+aws-msk-iam-sasl-signer-python
