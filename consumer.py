@@ -22,7 +22,7 @@ import time
 import psycopg2
 from collections import defaultdict
 from os import environ
-
+import os 
 from recoReader import decode_line, group_and_decorate, load_rates
 from aws_msk_iam_sasl_signer import MSKAuthTokenProvider
 
@@ -36,11 +36,12 @@ def oauth_callback(config):
 # ── Config ────────────────────────────────────────────────────────────────────
 
 DB_CONFIG = {
-    "host":     "localhost",
+    "host":     "amadeusdb.cluster-c7ms6magi7wm.eu-west-3.rds.amazonaws.com",
     "port":     5432,
     "dbname":   "amadeus",
     "user":     "postgres",
-    "password": "test"
+    "password": "amadeusdb",
+    "sslmode":  "require",
 }
 
 QUOTA = 1000  # max strict de searches retenues par OnD par jour
@@ -59,7 +60,7 @@ def should_accept(ond, date):
 
 def reset_at_midnight():
     while True:
-        now = datetime.datetime.now(datetime.UTC)
+        now = datetime.datetime.now(datetime.timezone.utc)
         midnight = (now + datetime.timedelta(days=1)).replace(
             hour=0, minute=0, second=0, microsecond=0
         )
@@ -233,15 +234,16 @@ def parse_args():
         description="Consumer: lit depuis Kafka ou un fichier local, insère dans PostgreSQL"
     )
     parser.add_argument("--mode", required=True, choices=["kafka", "local"])
-    parser.add_argument("--broker", default="localhost:9092")
-    parser.add_argument("--topic", default="travel-recos")
+    parser.add_argument("--broker", default=os.environ["BOOTSTRAP_SERVER"])
+    parser.add_argument("--topic", default=os.environ["TOPIC"])
     parser.add_argument("--input-file", default="travel_data_example.csv.gz")
-    parser.add_argument("--rates-file", default="etc/eurofxref.csv")
+    parser.add_argument("--rates-file", default=os.environ["RATES_FILE"])
     return parser.parse_args()
 
 
 def main():
     args = parse_args()
+
     rates = load_rates(args.rates_file)
     conn = get_db_connection()
     cursor = conn.cursor()
