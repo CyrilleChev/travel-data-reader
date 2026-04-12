@@ -19,12 +19,30 @@ import gzip
 import threading
 import datetime
 import time
+import uuid
 import psycopg2
+import boto3
 from collections import defaultdict
 from os import environ
-import os 
+import os
 from recoReader import decode_line, group_and_decorate, load_rates
 from aws_msk_iam_sasl_signer import MSKAuthTokenProvider
+
+S3_BUCKET = environ.get("S3_RAW_BUCKET", "travel-recos-raw")
+S3_PREFIX = environ.get("S3_RAW_PREFIX", "raw")
+
+s3_client = boto3.client("s3", region_name=environ.get("REGION", "eu-west-3"))
+
+def save_raw_to_s3(raw_bytes, partition, offset):
+    """Save the raw gzip message to S3 before any processing."""
+    now = datetime.datetime.now(datetime.timezone.utc)
+    key = (
+        f"{S3_PREFIX}/"
+        f"{now.strftime('%Y/%m/%d/%H')}/"
+        f"p{partition}-o{offset}-{uuid.uuid4().hex[:8]}.csv.gz"
+    )
+    s3_client.put_object(Bucket=S3_BUCKET, Key=key, Body=raw_bytes)
+    return key
 
 REGION = environ.get("REGION", "eu-west-3")
 
@@ -196,6 +214,13 @@ def run_kafka(args, rates, cursor, conn, stats):
                 f"offset={msg.offset()} "
                 f"size={len(msg.value())}B"
             )
+
+            # Save raw to S3 before any processing
+            try:
+                s3_key = save_raw_to_s3(msg.value(), msg.partition(), msg.offset())
+                print(f"[S3] Saved raw → s3://{S3_BUCKET}/{s3_key}")
+            except Exception as e:
+                print(f"[S3 ERROR] Failed to save raw: {e}")
 
             try:
                 raw_csv = gzip.decompress(msg.value()).decode("utf-8")
