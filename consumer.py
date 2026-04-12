@@ -15,7 +15,9 @@ Usage:
 """
 
 import argparse
+import csv
 import gzip
+import random
 import threading
 import datetime
 import time
@@ -62,29 +64,34 @@ DB_CONFIG = {
     "sslmode":  "require",
 }
 
-QUOTA = 1000  # max strict de searches retenues par OnD par jour
+TARGET_PER_OND_PER_DAY = 1000
+DEFAULT_ACCEPT_PROB = 1.0  # for OnDs not in the frequencies file
 
 
 # ── Sampling ──────────────────────────────────────────────────────────────────
 
-counters = defaultdict(int)
+ond_probabilities = {}
 
-def should_accept(ond, date):
-    key = (ond, date)
-    if counters[key] < QUOTA:
-        counters[key] += 1
-        return True
-    return False
+def load_ond_probabilities(filepath):
+    """Load ond_frequencies.csv and compute acceptance probability per OnD.
+    p = min(1.0, TARGET / avg_daily_searches)
+    """
+    with open(filepath, "r") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            ond = row["ond"]
+            avg_daily = float(row["avg_daily_searches"])
+            p = min(1.0, TARGET_PER_OND_PER_DAY / avg_daily) if avg_daily > 0 else 1.0
+            ond_probabilities[ond] = p
 
-def reset_at_midnight():
-    while True:
-        now = datetime.datetime.now(datetime.timezone.utc)
-        midnight = (now + datetime.timedelta(days=1)).replace(
-            hour=0, minute=0, second=0, microsecond=0
-        )
-        time.sleep((midnight - now).total_seconds())
-        counters.clear()
-        print("[SAMPLING] Compteurs remis à zéro (minuit UTC)")
+    print(f"[SAMPLING] Loaded {len(ond_probabilities)} OnD probabilities")
+    print(f"[SAMPLING] Examples: {dict(list(ond_probabilities.items())[:5])}")
+
+
+def should_accept(ond):
+    """Accept search with probability p = min(1, 1000 / avg_daily_searches)."""
+    p = ond_probabilities.get(ond, DEFAULT_ACCEPT_PROB)
+    return random.random() < p
 
 
 # ── PostgreSQL ────────────────────────────────────────────────────────────────
@@ -122,9 +129,8 @@ def insert_search(cursor, conn, search):
 def process_search(search, cursor, conn, stats):
     stats["seen"] += 1
     ond = search.get("OnD", "")
-    date = search.get("search_date", "")
 
-    if should_accept(ond, date):
+    if should_accept(ond):
         insert_search(cursor, conn, search)
         stats["inserted_searches"] += 1
         stats["inserted_recos"] += len(search.get("recos", []))
@@ -263,6 +269,7 @@ def parse_args():
     parser.add_argument("--topic", default=os.environ["TOPIC"])
     parser.add_argument("--input-file", default="travel_data_example.csv.gz")
     parser.add_argument("--rates-file", default=os.environ["RATES_FILE"])
+    parser.add_argument("--ond-freq", required=True, help="Path to ond_frequencies.csv from count_ond.py")
     return parser.parse_args()
 
 
@@ -270,10 +277,9 @@ def main():
     args = parse_args()
 
     rates = load_rates(args.rates_file)
+    load_ond_probabilities(args.ond_freq)
     conn = get_db_connection()
     cursor = conn.cursor()
-
-    threading.Thread(target=reset_at_midnight, daemon=True).start()
 
     stats = {"seen": 0, "inserted_searches": 0, "inserted_recos": 0}
 
