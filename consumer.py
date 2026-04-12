@@ -21,8 +21,16 @@ import datetime
 import time
 import psycopg2
 from collections import defaultdict
+from os import environ
 
 from recoReader import decode_line, group_and_decorate, load_rates
+from aws_msk_iam_sasl_signer import MSKAuthTokenProvider
+
+REGION = environ.get("REGION", "eu-west-3")
+
+def oauth_callback(config):
+    token, expiry_ms = MSKAuthTokenProvider.generate_auth_token(REGION)
+    return token, expiry_ms / 1000
 
 
 # ── Config ────────────────────────────────────────────────────────────────────
@@ -161,6 +169,9 @@ def run_kafka(args, rates, cursor, conn, stats):
         "group.id":             "amadeus-consumer-group",
         "auto.offset.reset":    "earliest",
         "enable.partition.eof": False,
+        "security.protocol":    "SASL_SSL",
+        "sasl.mechanism":       "OAUTHBEARER",
+        "oauth_cb":             oauth_callback,
     })
     consumer.subscribe([args.topic])
 
