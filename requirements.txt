@@ -3,3 +3,4 @@ pytest
 numpy
 confluent_kafka
 aws-msk-iam-sasl-signer-python
+psycopg2-binary

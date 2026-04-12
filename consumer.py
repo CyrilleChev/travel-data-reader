@@ -100,15 +100,17 @@ def get_db_connection():
     return psycopg2.connect(**DB_CONFIG)
 
 def insert_search(cursor, conn, search):
-    for reco in search.get("recos", []):
-        cursor.execute("""
-            INSERT INTO recos (
-                search_id, search_date, search_country,
-                ond, trip_type, advance_purchase,
-                stay_duration, airline, cabin,
-                price_eur, nb_connections
-            ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
-        """, (
+    recos = search.get("recos", [])
+    if not recos:
+        return
+    
+    # Prepare all rows and flatten parameters
+    values = []
+    params = []
+    
+    for reco in recos:
+        values.append("(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)")
+        params.extend([
             search["search_id"],
             search["search_date"],
             search["search_country"],
@@ -120,7 +122,19 @@ def insert_search(cursor, conn, search):
             reco.get("main_cabin", ""),
             reco.get("price_EUR", 0.0),
             max(0, len(reco.get("flights", [])) - 1)
-        ))
+        ])
+    
+    # Single INSERT with all value sets
+    query = f"""
+        INSERT INTO recos (
+            search_id, search_date, search_country,
+            ond, trip_type, advance_purchase,
+            stay_duration, airline, cabin,
+            price_eur, nb_connections
+        ) VALUES {','.join(values)}
+    """
+    
+    cursor.execute(query, params)
     conn.commit()
 
 
