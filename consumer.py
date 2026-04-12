@@ -269,7 +269,7 @@ def parse_args():
     parser.add_argument("--topic", default=os.environ["TOPIC"])
     parser.add_argument("--input-file", default="travel_data_example.csv.gz")
     parser.add_argument("--rates-file", default=os.environ["RATES_FILE"])
-    parser.add_argument("--ond-freq", required=True, help="Path to ond_frequencies.csv from count_ond.py")
+    parser.add_argument("--ond-freq", default=os.environ["OND_FREQ"], help="Path to ond_frequencies.csv from count_ond.py")
     return parser.parse_args()
 
 
